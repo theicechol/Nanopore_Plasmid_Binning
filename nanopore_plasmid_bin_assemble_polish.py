@@ -1,125 +1,208 @@
 #!/usr/bin/env python3
 
-import os
-import gzip
-import glob
 import argparse
-from Bio import SeqIO
+import csv
+import gzip
+import re
+import subprocess
+from collections import Counter
+from pathlib import Path
+
+import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
-import matplotlib.pyplot as plt
+from Bio import SeqIO
+from Bio.Seq import Seq
+from Bio.SeqRecord import SeqRecord
 
-def main(output_folder, input_fastq, num_threads, canu_binary_path):
-    # Check if output folder exists, create if not
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
+from plasmid_qc_report import generate_qc_report
 
-    # Add backslash to output folder path if not present
-    if output_folder[-1] != '/':
-        output_folder += '/'
 
-    #check if input fastq is gzipped, if not, gzip it
-    if not input_fastq.endswith('.gz'):
-        os.system(f'gzip {input_fastq}')
-        input_fastq = input_fastq + '.gz'
+MARKER_WORDS = ("origin", "ori", "resistance", "ampr", "kanr", "cmr", "smr", "tetr", "beta-lactamase", "chloramphenicol", "kanamycin", "streptomycin", "tetracycline")
 
-    # Read in fastQ and collect read lengths
-    read_lengths = []
-    with gzip.open(input_fastq, "rt") as f:
-        for record in SeqIO.parse(f, "fastq"):
-            read_lengths.append(len(record.seq))
 
-    # Convert read_lengths to numpy array for analysis
-    read_lengths = np.array(read_lengths)
-    bins = np.array(range(read_lengths.min(), read_lengths.max(), 200))
+def open_fastq(path):
+    return gzip.open(path, "rt") if str(path).endswith(".gz") else open(path, "rt")
 
-    # Average and standard deviation of number of reads per bin
-    avg_density = np.mean([len(read_lengths[(read_lengths >= bins[i]) & (read_lengths < bins[i+1])]) for i in range(len(bins)-1)])
-    std_density = np.std([len(read_lengths[(read_lengths >= bins[i]) & (read_lengths < bins[i+1])]) for i in range(len(bins)-1)])
-    
-    # three sigma cutoff
-    two_sigma = avg_density + 3 * std_density
-    
-    # Find bins where the number of reads exceeds the two sigma cutoff
-    bins_two_sigma = [bins[i] for i in range(len(bins)-1) if len(read_lengths[(read_lengths >= bins[i]) & (read_lengths < bins[i+1])]) > two_sigma]
 
-    # Extract reads for each bin that is greater than two sigma
-    for bin in bins_two_sigma:
-        with gzip.open(input_fastq, "rt") as f:
-            reads = [record for record in SeqIO.parse(f, "fastq") if len(record.seq) >= (bin-200) and len(record.seq) <= (bin+200)]
-            with open(f'{output_folder}{bin.round(0)}.fastq', 'w') as f_out:
-                SeqIO.write(reads, f_out, "fastq")
+def canonical_kmer(sequence):
+    return min(sequence, str(Seq(sequence).reverse_complement()))
 
-    # Plot the histogram of read lengths
-    sns.histplot(read_lengths, binwidth=200)
-    plt.axhline(y=two_sigma, color='gray', linestyle='--', label='Average + 2*std')
-    plt.text(max(read_lengths) + 0.05*max(read_lengths), two_sigma, f'binning cutoff', fontsize=10, color='gray')
-    sns.despine()
-    #set x axis label
-    plt.xlabel('Read Length')
-    plt.savefig(f'{output_folder}read_length_hist.png', bbox_inches='tight', dpi=600)
 
-    # Check the number of reads extracted for each bin
-    for file in glob.glob(f'{output_folder}*.fastq'):
-        print(f'{file}: {len(list(SeqIO.parse(file, "fastq")))} reads')
+def sequence_kmers(sequence, k):
+    sequence = str(sequence).upper()
+    return {canonical_kmer(sequence[i:i + k]) for i in range(len(sequence) - k + 1) if set(sequence[i:i + k]) <= {"A", "C", "G", "T"}}
 
-    # Run Canu for each extracted bin
-    for read_file in glob.glob(f"{output_folder}*.fastq"):
-        # Create Canu output folder
-        canu_output_folder = f'{output_folder}canu_output_{os.path.basename(read_file).replace(".fastq", "")}'
-        if not os.path.exists(canu_output_folder):
-            os.makedirs(canu_output_folder)
 
-        basename = os.path.basename(read_file).replace(".fastq", "").split(".")[0]
-        genome_size = int(round((int(basename)/1000), 0))
+def feature_label(feature):
+    values = []
+    for key in ("label", "gene", "product", "note"):
+        values.extend(feature.qualifiers.get(key, []))
+    return "; ".join(values)
 
-        # Run Canu command
-        canu_command = f"{canu_binary_path} -p {basename} -d {canu_output_folder} genomeSize={genome_size}k -nanopore {read_file}"
-        os.system(canu_command)
 
-    # Trim and polish the Canu outputs
-    trimmed_paths = []
-    for canu_output_folder in glob.glob(f'{output_folder}canu_output_*'):
-        # Get the contigs file
-        contigs_file = glob.glob(f'{canu_output_folder}/*.contigs.fasta')[0]
-        basename = os.path.basename(canu_output_folder).replace("canu_output_", "")
-        count = 0
+def load_references(paths, k):
+    references, marker_kmers = {}, {}
+    for path_string in paths:
+        path = Path(path_string)
+        file_format = "genbank" if path.suffix.lower() in {".gb", ".gbk", ".genbank"} else "fasta"
+        records = list(SeqIO.parse(path, file_format))
+        if len(records) != 1:
+            raise ValueError(f"Reference {path} must contain exactly one sequence")
+        record = records[0]
+        name = re.sub(r"[^A-Za-z0-9_.-]+", "_", path.stem or record.id)
+        if name in references:
+            raise ValueError(f"Duplicate reference name: {name}")
+        references[name], marker_kmers[name] = record, {}
+        if file_format == "genbank":
+            for feature in record.features:
+                label = feature_label(feature)
+                if label and any(word in label.lower() for word in MARKER_WORDS):
+                    kmers = sequence_kmers(feature.extract(record.seq), k)
+                    if kmers:
+                        marker_kmers[name][label] = kmers
 
-        for record in SeqIO.parse(contigs_file, 'fasta'):
-            count += 1
-            trimmed_contigs_file = f'{canu_output_folder}/{basename}_{count}.trimmed_contigs.fasta'
+    all_kmers = {name: sequence_kmers(record.seq, k) for name, record in references.items()}
+    unique_kmers = {}
+    for name, kmers in all_kmers.items():
+        others = set().union(*(value for other, value in all_kmers.items() if other != name))
+        unique_kmers[name] = kmers - others
+    for name, markers in marker_kmers.items():
+        for label in list(markers):
+            markers[label] &= unique_kmers[name]
+            if not markers[label]:
+                del markers[label]
+    return references, unique_kmers, marker_kmers
 
-            if "suggestCircular=yes" in record.description:
-                print(f"This contig is circular: {basename}_{count}")
-                trim_left = int(record.description.split("trim=")[1].split("-")[0])
-                trim_right = int(record.description.split("trim=")[1].split("-")[1])
-                trimmed_seq = record.seq[trim_left:trim_right]
-                with open(trimmed_contigs_file, 'w') as f_out:
-                    f_out.write(">" + f"{basename}_{count}" + "\n")
-                    f_out.write(str(trimmed_seq) + "\n")
-                trimmed_paths.append(trimmed_contigs_file)
-            else:
-                print(f"This contig is not circular: {basename}_{count}")
-                with open(trimmed_contigs_file, 'w') as f_out:
-                    f_out.write(">" + f"{basename}_{count}" + "\n")
-                    f_out.write(str(record.seq) + "\n")
-                trimmed_paths.append(trimmed_contigs_file)
 
-    # Run Medaka polishing
-    for contig_path in trimmed_paths:
-        polished_output_folder = f'{output_folder}polished_output_{os.path.basename(contig_path).replace(".fasta", "")}'
-        medaka_command = f"medaka_consensus -i {input_fastq} -d {contig_path} -o {polished_output_folder} -t {num_threads} --bacteria"
-        os.system(medaka_command)
+def classify_read(record, unique_kmers, marker_kmers, k, min_hits, min_ratio):
+    read_kmers = sequence_kmers(record.seq, k)
+    hits = {name: len(read_kmers & kmers) for name, kmers in unique_kmers.items()}
+    ranked = sorted(hits, key=hits.get, reverse=True)
+    best = ranked[0]
+    second_hits = hits[ranked[1]] if len(ranked) > 1 else 0
+    ratio = hits[best] / max(1, second_hits)
+    assignment = best if hits[best] >= min_hits and ratio >= min_ratio else "ambiguous"
+    markers = [] if assignment == "ambiguous" else [label for label, kmers in marker_kmers[assignment].items() if len(read_kmers & kmers) >= min_hits]
+    return assignment, hits, ratio, markers
 
-if __name__ == '__main__':
-    # Setup argument parsing
-    parser = argparse.ArgumentParser(description="Process Nanopore reads and polish contigs")
-    parser.add_argument('--output_folder','-o', required=True, help="Output folder path")
-    parser.add_argument('--input_fastq','-i', required=True, help="Input FastQ file path")
-    parser.add_argument('--num_threads','-t', required=False, default=1, type=int, help="Number of threads (default: 1)")
-    parser.add_argument('--canu_binary_path','-c', required=True, help="Path to Canu binary")
 
-    args = parser.parse_args()
+def reference_bin_reads(input_fastq, output_folder, reference_paths, k, min_hits, min_ratio):
+    references, unique_kmers, marker_kmers = load_references(reference_paths, k)
+    handles = {name: open(output_folder / f"{name}.fastq", "w") for name in [*references, "ambiguous"]}
+    counts = Counter()
+    try:
+        with open(output_folder / "read_assignments.tsv", "w", newline="") as report, open_fastq(input_fastq) as source:
+            writer = csv.writer(report, delimiter="\t")
+            writer.writerow(["read_id", "length", "assignment", "best_to_second_ratio", "marker_evidence", *references])
+            for record in SeqIO.parse(source, "fastq"):
+                assignment, hits, ratio, markers = classify_read(record, unique_kmers, marker_kmers, k, min_hits, min_ratio)
+                SeqIO.write(record, handles[assignment], "fastq")
+                counts[assignment] += 1
+                writer.writerow([record.id, len(record.seq), assignment, f"{ratio:.3f}", "; ".join(markers), *(hits[name] for name in references)])
+    finally:
+        for handle in handles.values():
+            handle.close()
+    print("Reference-specific k-mers:", ", ".join(f"{name}={len(kmers)}" for name, kmers in unique_kmers.items()))
+    print("Read assignments:", ", ".join(f"{name}={counts[name]}" for name in [*references, "ambiguous"]))
+    return [output_folder / f"{name}.fastq" for name in references if counts[name] > 0]
 
-    # Call the main function with arguments
-    main(args.output_folder, args.input_fastq, args.num_threads, args.canu_binary_path)
+
+def length_bin_reads(input_fastq, output_folder):
+    with open_fastq(input_fastq) as source:
+        records = list(SeqIO.parse(source, "fastq"))
+    if not records:
+        raise ValueError("Input FASTQ contains no reads")
+    lengths = np.array([len(record.seq) for record in records])
+    edges = np.arange(lengths.min(), lengths.max() + 201, 200)
+    counts, _ = np.histogram(lengths, bins=edges)
+    cutoff = counts.mean() + 3 * counts.std()
+    read_files = []
+    for index in np.where(counts > cutoff)[0]:
+        center = int(edges[index] + 100)
+        reads = [record for record in records if center - 200 <= len(record.seq) <= center + 200]
+        path = output_folder / f"length_{center}.fastq"
+        SeqIO.write(reads, path, "fastq")
+        read_files.append(path)
+    sns.histplot(lengths, binwidth=200)
+    plt.axhline(y=cutoff, color="gray", linestyle="--", label="mean + 3 SD")
+    plt.xlabel("Read length")
+    plt.savefig(output_folder / "read_length_hist.png", bbox_inches="tight", dpi=300)
+    plt.close()
+    return read_files
+
+
+def run_command(command):
+    print("Running:", " ".join(map(str, command)))
+    subprocess.run([str(value) for value in command], check=True)
+
+
+def assemble_and_polish(read_files, output_folder, canu_binary_path, num_threads):
+    for read_file in read_files:
+        name = read_file.stem
+        lengths = [len(record.seq) for record in SeqIO.parse(read_file, "fastq")]
+        if not lengths:
+            continue
+        genome_size = max(1, round(np.median(lengths) / 1000))
+        canu_folder = output_folder / f"canu_output_{name}"
+        run_command([canu_binary_path, "-p", name, "-d", canu_folder, f"genomeSize={genome_size}k", f"maxThreads={num_threads}", "-nanopore", read_file])
+        contigs = list(canu_folder.glob("*.contigs.fasta"))
+        if not contigs:
+            raise RuntimeError(f"Canu produced no contigs for {read_file}")
+        for count, record in enumerate(SeqIO.parse(contigs[0], "fasta"), start=1):
+            sequence = record.seq
+            if "suggestCircular=yes" in record.description and "trim=" in record.description:
+                bounds = record.description.split("trim=", 1)[1].split()[0].split("-")
+                sequence = sequence[int(bounds[0]):int(bounds[1])]
+            trimmed = canu_folder / f"{name}_{count}.trimmed_contigs.fasta"
+            SeqIO.write(SeqRecord(sequence, id=f"{name}_{count}", description=""), trimmed, "fasta")
+            polished = output_folder / f"polished_output_{name}_{count}"
+            run_command(["medaka_consensus", "-i", read_file, "-d", trimmed, "-o", polished, "-t", num_threads, "--bacteria"])
+
+
+def main(args):
+    output_folder = Path(args.output_folder)
+    output_folder.mkdir(parents=True, exist_ok=True)
+    if args.references:
+        read_files = reference_bin_reads(Path(args.input_fastq), output_folder, args.references, args.kmer_size, args.min_unique_kmers, args.min_assignment_ratio)
+    else:
+        read_files = length_bin_reads(Path(args.input_fastq), output_folder)
+    for path in read_files:
+        print(f"{path}: {sum(1 for _ in SeqIO.parse(path, 'fastq'))} reads")
+    if not args.no_qc_report:
+        report = generate_qc_report(
+            input_fastq=args.input_fastq,
+            output_folder=output_folder,
+            reference_paths=args.references,
+            assignment_path=output_folder / "read_assignments.tsv",
+            host_reference=args.host_reference,
+            host_name=args.host_name,
+            host_key=args.host,
+            skip_host=args.skip_host_screen,
+            multimer_tolerance=args.multimer_tolerance,
+        )
+        print(f"QC report: {report}")
+    if not args.binning_only:
+        if not args.canu_binary_path:
+            raise ValueError("--canu_binary_path is required unless --binning-only is used")
+        assemble_and_polish(read_files, output_folder, args.canu_binary_path, args.num_threads)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Bin, assemble, and polish Nanopore plasmid reads")
+    parser.add_argument("--output_folder", "-o", required=True)
+    parser.add_argument("--input_fastq", "-i", required=True)
+    parser.add_argument("--num_threads", "-t", default=1, type=int)
+    parser.add_argument("--canu_binary_path", "-c")
+    parser.add_argument("--references", "-r", nargs="+", help="Candidate plasmid GenBank or FASTA files")
+    parser.add_argument("--kmer-size", type=int, default=15)
+    parser.add_argument("--min-unique-kmers", type=int, default=10)
+    parser.add_argument("--min-assignment-ratio", type=float, default=2.0)
+    parser.add_argument("--binning-only", action="store_true", help="Write read bins without assembly or polishing")
+    parser.add_argument("--no-qc-report", action="store_true", help="Do not generate the graphical HTML QC report")
+    parser.add_argument("--host-reference", help="Host genome FASTA (default: download E. coli K-12 MG1655 from NCBI)")
+    parser.add_argument("--host", choices=("ecoli", "vibrio-natriegens", "bacillus-subtilis"), default="ecoli", help="Built-in cloning-host genome used for contamination screening")
+    parser.add_argument("--host-name", default="E. coli", help="Host label shown in the report")
+    parser.add_argument("--skip-host-screen", action="store_true", help="Generate QC without host-genome mapping")
+    parser.add_argument("--multimer-tolerance", type=float, default=0.15, help="Relative length tolerance for monomer/dimer calls")
+    main(parser.parse_args())

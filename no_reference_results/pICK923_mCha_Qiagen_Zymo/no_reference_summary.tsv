@@ -1,0 +1,3 @@
+rank	length	topology	cluster_reads	median_kmer_support	multimer_peaks	001_pICK923_mCha_Qiagen_reads	002_pICK923_mCha_Zymo_reads
+1	5840	circular	719	0.9449	2-mer:11656bp/326reads	230	486
+2	7702	linear	129	0.9276		38	91
