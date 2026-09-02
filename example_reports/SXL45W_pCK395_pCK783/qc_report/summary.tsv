@@ -1,0 +1,9 @@
+metric	value
+total_reads	149
+median_read_length	4156
+read_length_n50	4156
+mean_read_quality	38.933
+host_reads	NA
+host_percent	NA
+host_reference	E. coli
+host_screen_status	skipped by user
